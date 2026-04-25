@@ -21,6 +21,11 @@ const PERIOD_MAP = {
   week: 102,
   month: 103,
 }
+const TENCENT_KLINE_KEY_MAP = {
+  day: 'qfqday',
+  week: 'qfqweek',
+  month: 'qfqmonth',
+}
 
 function getCached(key) {
   const record = cache.get(key)
@@ -61,6 +66,10 @@ function inferMarket(code) {
 
 function toSecId(code) {
   return `${inferMarket(code)}.${code}`
+}
+
+function toTencentSymbol(code) {
+  return `${inferMarket(code) === 1 ? 'sh' : 'sz'}${code}`
 }
 
 function normalizeCodes(codesParam) {
@@ -115,23 +124,225 @@ function parseKlineRow(row) {
   }
 }
 
-async function fetchDailySparkline(code) {
-  return withCache(`spark:${code}`, 60_000, async () => {
-    const response = await EASTMONEY.get('https://push2his.eastmoney.com/api/qt/stock/kline/get', {
+function pickSparklineValues(points, maxPoints = 56) {
+  if (!points.length) {
+    return []
+  }
+
+  if (points.length <= maxPoints) {
+    return points.map((point) => point.close)
+  }
+
+  const sampled = []
+
+  for (let index = 0; index < maxPoints; index += 1) {
+    const sourceIndex = Math.round((index * (points.length - 1)) / (maxPoints - 1))
+    sampled.push(points[sourceIndex].close)
+  }
+
+  return sampled
+}
+
+function formatTencentTradeDate(rawValue) {
+  if (/^\d{8,}$/.test(rawValue)) {
+    return `${rawValue.slice(0, 4)}-${rawValue.slice(4, 6)}-${rawValue.slice(6, 8)}`
+  }
+
+  return new Date().toISOString().slice(0, 10)
+}
+
+function formatTencentMinute(rawValue) {
+  if (/^\d{4}$/.test(rawValue)) {
+    return `${rawValue.slice(0, 2)}:${rawValue.slice(2, 4)}`
+  }
+
+  return rawValue
+}
+
+function parseTencentMinuteRows(rows, tradeDate) {
+  let previousLots = 0
+  let previousAmount = 0
+  const normalizedDate = formatTencentTradeDate(tradeDate)
+
+  return rows.map((row) => {
+    const [rawTime, rawPrice, rawLots, rawAmount] = row.trim().split(/\s+/)
+    const close = Number(rawPrice)
+    const cumulativeLots = Number(rawLots)
+    const cumulativeAmount = Number(rawAmount)
+    const lots = previousLots > 0 ? Math.max(cumulativeLots - previousLots, 0) : cumulativeLots
+    const amount = previousAmount > 0 ? Math.max(cumulativeAmount - previousAmount, 0) : cumulativeAmount
+    const average = cumulativeLots > 0 ? cumulativeAmount / (cumulativeLots * 100) : close
+
+    previousLots = cumulativeLots
+    previousAmount = cumulativeAmount
+
+    return {
+      timestamp: `${normalizedDate} ${formatTencentMinute(rawTime)}`,
+      open: close,
+      close,
+      high: close,
+      low: close,
+      volume: lots * 100,
+      amount,
+      average: Number(average.toFixed(2)),
+    }
+  })
+}
+
+function parseTencentKlineRows(rows) {
+  let previousClose = null
+
+  return rows.map((row) => {
+    const [date, open, close, high, low, volume] = row
+    const openValue = Number(open)
+    const closeValue = Number(close)
+    const highValue = Number(high)
+    const lowValue = Number(low)
+    const volumeValue = Number(volume) * 100
+    const referenceClose = previousClose ?? openValue
+    const change = closeValue - referenceClose
+    const changePct = referenceClose ? (change / referenceClose) * 100 : 0
+    const amplitude = referenceClose ? ((highValue - lowValue) / referenceClose) * 100 : 0
+
+    previousClose = closeValue
+
+    return {
+      date,
+      open: openValue,
+      close: closeValue,
+      high: highValue,
+      low: lowValue,
+      volume: volumeValue,
+      amount: 0,
+      amplitude: Number(amplitude.toFixed(2)),
+      changePct: Number(changePct.toFixed(2)),
+      change: Number(change.toFixed(2)),
+      turnover: 0,
+    }
+  })
+}
+
+function getTencentQuoteMeta(stock, symbol) {
+  const quote = stock?.qt?.[symbol]
+  return {
+    name: quote?.[1] || symbol,
+    preClose: Number(quote?.[4] || 0),
+    tradeDate: String(quote?.[30] || ''),
+  }
+}
+
+async function fetchTencentJson(url) {
+  const response = await fetch(url, {
+    headers: {
+      Referer: 'https://gu.qq.com/',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(`trend fallback request failed with status ${response.status}`)
+  }
+
+  return response.json()
+}
+
+async function fetchTencentTrend(code, period) {
+  const symbol = toTencentSymbol(code)
+
+  if (period === 'intraday') {
+    const payload = await fetchTencentJson(`https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=${symbol}`)
+    const stock = payload.data?.[symbol]
+    const meta = getTencentQuoteMeta(stock, symbol)
+    const points = parseTencentMinuteRows(stock?.data?.data || [], meta.tradeDate)
+
+    if (!points.length) {
+      throw new Error('intraday fallback returned empty data')
+    }
+
+    return {
+      code,
+      name: meta.name || code,
+      period,
+      preClose: meta.preClose,
+      points,
+    }
+  }
+
+  const seriesKey = TENCENT_KLINE_KEY_MAP[period] || TENCENT_KLINE_KEY_MAP.day
+  const payload = await fetchTencentJson(`https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${symbol},${period},,,240,qfq`)
+  const stock = payload.data?.[symbol]
+  const meta = getTencentQuoteMeta(stock, symbol)
+  const points = parseTencentKlineRows(stock?.[seriesKey] || [])
+
+  if (!points.length) {
+    throw new Error('kline fallback returned empty data')
+  }
+
+  return {
+    code,
+    name: meta.name || code,
+    period,
+    points,
+  }
+}
+
+async function fetchPrimaryTrend(code, period) {
+  if (period === 'intraday') {
+    const response = await EASTMONEY.get('https://push2.eastmoney.com/api/qt/stock/trends2/get', {
       params: {
         secid: toSecId(code),
-        klt: 101,
-        fqt: 1,
-        beg: 0,
-        end: 20500000,
-        lmt: 24,
-        fields1: 'f1,f2,f3,f4,f5,f6',
-        fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+        fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
+        fields2: 'f51,f52,f53,f54,f55,f56,f57,f58',
+        iscr: 0,
+        ndays: 1,
         ut: 'fa5fd1943c7b386f172d6893dbfba10b',
       },
     })
 
-    return (response.data?.data?.klines || []).map(parseKlineRow)
+    const data = response.data?.data
+    return {
+      code,
+      name: data?.name || code,
+      period,
+      preClose: Number(data?.preClose || data?.prePrice || 0),
+      points: (data?.trends || []).map(parseTrendRow),
+    }
+  }
+
+  const klt = PERIOD_MAP[period] || PERIOD_MAP.day
+  const response = await EASTMONEY.get('https://push2his.eastmoney.com/api/qt/stock/kline/get', {
+    params: {
+      secid: toSecId(code),
+      klt,
+      fqt: 1,
+      beg: 0,
+      end: 20500000,
+      lmt: 240,
+      fields1: 'f1,f2,f3,f4,f5,f6',
+      fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+      ut: 'fa5fd1943c7b386f172d6893dbfba10b',
+    },
+  })
+
+  const data = response.data?.data
+  return {
+    code,
+    name: data?.name || code,
+    period,
+    points: (data?.klines || []).map(parseKlineRow),
+  }
+}
+
+async function fetchIntradaySparkline(code) {
+  return withCache(`spark:${code}`, 20_000, async () => {
+    try {
+      const trend = await fetchPrimaryTrend(code, 'intraday')
+      return pickSparklineValues(trend.points)
+    } catch {
+      const fallbackTrend = await fetchTencentTrend(code, 'intraday')
+      return pickSparklineValues(fallbackTrend.points)
+    }
   })
 }
 
@@ -154,8 +365,8 @@ export async function fetchQuotes(codesParam) {
     const sparklines = await Promise.all(
       codes.map(async (code) => {
         try {
-          const series = await fetchDailySparkline(code)
-          return [code, series.slice(-20).map((point) => point.close)]
+          const series = await fetchIntradaySparkline(code)
+          return [code, series]
         } catch {
           return [code, []]
         }
@@ -187,53 +398,15 @@ export async function fetchTrend(code, period = 'intraday') {
     throw new Error('股票代码格式不正确')
   }
 
-  if (period === 'intraday') {
-    return withCache(`trend:${code}:${period}`, 20_000, async () => {
-      const response = await EASTMONEY.get('https://push2.eastmoney.com/api/qt/stock/trends2/get', {
-        params: {
-          secid: toSecId(code),
-          fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
-          fields2: 'f51,f52,f53,f54,f55,f56,f57,f58',
-          iscr: 0,
-          ndays: 1,
-          ut: 'fa5fd1943c7b386f172d6893dbfba10b',
-        },
-      })
-
-      const data = response.data?.data
-      return {
-        code,
-        name: data?.name || code,
-        period,
-        preClose: Number(data?.preClose || data?.prePrice || 0),
-        points: (data?.trends || []).map(parseTrendRow),
+  return withCache(`trend:${code}:${period}`, period === 'intraday' ? 20_000 : 60_000, async () => {
+    try {
+      return await fetchPrimaryTrend(code, period)
+    } catch {
+      try {
+        return await fetchTencentTrend(code, period)
+      } catch {
+        throw new Error('暂时拿不到走势图数据，请稍后重试')
       }
-    })
-  }
-
-  const klt = PERIOD_MAP[period] || PERIOD_MAP.day
-
-  return withCache(`trend:${code}:${period}`, 60_000, async () => {
-    const response = await EASTMONEY.get('https://push2his.eastmoney.com/api/qt/stock/kline/get', {
-      params: {
-        secid: toSecId(code),
-        klt,
-        fqt: 1,
-        beg: 0,
-        end: 20500000,
-        lmt: 240,
-        fields1: 'f1,f2,f3,f4,f5,f6',
-        fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
-        ut: 'fa5fd1943c7b386f172d6893dbfba10b',
-      },
-    })
-
-    const data = response.data?.data
-    return {
-      code,
-      name: data?.name || code,
-      period,
-      points: (data?.klines || []).map(parseKlineRow),
     }
   })
 }

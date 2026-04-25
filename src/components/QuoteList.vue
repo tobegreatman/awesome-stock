@@ -3,7 +3,7 @@
     <div class="panel-head">
       <div>
         <h2 class="panel-title">股票池速览</h2>
-        <p class="panel-copy">点击任意股票切换右侧详情。微图使用最近交易日收盘序列，便于快速比较节奏。</p>
+        <p class="panel-copy">点击任意股票切换右侧详情。微图展示当日盘中分时节奏，便于快速比较强弱切换。</p>
       </div>
     </div>
 
