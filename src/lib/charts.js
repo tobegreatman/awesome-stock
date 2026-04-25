@@ -77,19 +77,30 @@ function getRatioBiasColor(value, { high = 66, low = 34, highColor = TOOLTIP_ACC
   return TOOLTIP_ACCENTS.flat
 }
 
+function getTreemapIntensity(value) {
+  const magnitude = Math.abs(Number(value) || 0)
+
+  if (magnitude <= 0.08) {
+    return 0
+  }
+
+  const normalized = Math.min(magnitude / 5.5, 1)
+  return 0.41 + normalized ** 0.62 * 0.6
+}
+
 function getUpColor(value) {
-  const intensity = Math.min(Math.abs(value) / 8, 1)
-  const red = Math.round(245 - intensity * 26)
-  const green = Math.round(245 - intensity * 180)
-  const blue = Math.round(245 - intensity * 185)
+  const intensity = getTreemapIntensity(value)
+  const red = Math.round(242 - intensity * 28)
+  const green = Math.round(235 - intensity * 168)
+  const blue = Math.round(234 - intensity * 172)
   return `rgb(${red}, ${green}, ${blue})`
 }
 
 function getDownColor(value) {
-  const intensity = Math.min(Math.abs(value) / 8, 1)
-  const red = Math.round(239 - intensity * 120)
-  const green = Math.round(247 - intensity * 92)
-  const blue = Math.round(239 - intensity * 150)
+  const intensity = getTreemapIntensity(value)
+  const red = Math.round(235 - intensity * 134)
+  const green = Math.round(241 - intensity * 108)
+  const blue = Math.round(234 - intensity * 144)
   return `rgb(${red}, ${green}, ${blue})`
 }
 
@@ -431,26 +442,31 @@ export function buildKlineOption(trend, movingAverageWindows = [], period = 'day
 
 export function buildTreemapOption(items, options = {}) {
   const weightMode = options.weightMode || 'blend'
-  const data = items.map((item) => ({
-    name: item.name,
-    value: getTreemapWeight(item, weightMode),
-    changePct: item.changePct,
-    mainNetInflow: item.mainNetInflow,
-    leadingStrength: item.leadingStrength,
-    weightMode,
-    itemStyle: {
-      color: getTreemapColor(item.changePct),
-      borderColor: 'rgba(5,5,5,0.4)',
-      borderWidth: 2,
-      gapWidth: 2,
-    },
-    label: {
-      formatter: `${item.name}\n${item.changePct > 0 ? '+' : ''}${item.changePct.toFixed(2)}%`,
-      color: item.changePct > 0.08 ? '#fff0f0' : item.changePct < -0.08 ? '#ecfff2' : '#0f172a',
-      fontWeight: 700,
-      lineHeight: 22,
-    },
-  }))
+  const data = items.map((item) => {
+    const colorIntensity = getTreemapIntensity(item.changePct)
+    const labelColor = colorIntensity >= 0.54 ? (item.changePct >= 0 ? '#fff5f5' : '#f3fff7') : '#0f172a'
+
+    return {
+      name: item.name,
+      value: getTreemapWeight(item, weightMode),
+      changePct: item.changePct,
+      mainNetInflow: item.mainNetInflow,
+      leadingStrength: item.leadingStrength,
+      weightMode,
+      itemStyle: {
+        color: getTreemapColor(item.changePct),
+        borderColor: 'rgba(5,5,5,0.4)',
+        borderWidth: 2,
+        gapWidth: 2,
+      },
+      label: {
+        formatter: `${item.name}\n${item.changePct > 0 ? '+' : ''}${item.changePct.toFixed(2)}%`,
+        color: labelColor,
+        fontWeight: 700,
+        lineHeight: 22,
+      },
+    }
+  })
 
   return {
     backgroundColor: 'transparent',
